@@ -128,14 +128,14 @@ def init_db():
         email TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
         bio TEXT DEFAULT '',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TEXT DEFAULT (datetime('now'))
     );
     CREATE TABLE IF NOT EXISTS posts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
         content TEXT,
         image_path TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TEXT DEFAULT (datetime('now')),
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
     );
     CREATE TABLE IF NOT EXISTS follows (
@@ -159,7 +159,7 @@ def init_db():
         user_id INTEGER NOT NULL,
         post_id INTEGER NOT NULL,
         content TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TEXT DEFAULT (datetime('now')),
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
         FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE
     );
