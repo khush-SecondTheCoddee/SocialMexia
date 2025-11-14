@@ -1,4 +1,4 @@
-# Full Production-Ready Single-File Flask App (No PIL/Pillow)
+# Full Production-Ready Single-File Flask App with JWT Cookie Auth
 # Admin account auto-created:
 #   username: admin
 #   email: admin@example.com
@@ -12,7 +12,7 @@ import functools
 import uuid
 from typing import Optional
 
-from flask import Flask, request, jsonify, g, send_from_directory, render_template_string, redirect
+from flask import Flask, request, jsonify, g, send_from_directory, render_template_string, make_response, redirect
 import jwt
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -93,16 +93,24 @@ def decode_token(token: str):
 def jwt_required(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
+        token = None
         auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
-            return jsonify({"error": "Missing or invalid Authorization header"}), 401
-        token = auth.split(" ", 1)[1].strip()
+        if auth.startswith("Bearer "):
+            token = auth.split(" ", 1)[1].strip()
+        elif request.cookies.get("token"):
+            token = request.cookies.get("token")
+
+        if not token:
+            return jsonify({"error": "Missing token"}), 401
+
         payload = decode_token(token)
         if not payload:
             return jsonify({"error": "Invalid or expired token"}), 401
+
         g.current_user = get_user_by_id(payload["sub"])
         if not g.current_user:
             return jsonify({"error": "User not found"}), 401
+
         return f(*args, **kwargs)
     return wrapper
 
@@ -282,7 +290,11 @@ def api_signup():
     except:
         return jsonify({"error": "Username or email already exists"}), 400
 
-    return jsonify({"status": "ok", "message": "User created"}), 201
+    row = query_db("SELECT * FROM users WHERE email=?", (email,), one=True)
+    token = create_token(row['id'])
+    resp = make_response(jsonify({"status": "ok", "message": "User created"}))
+    resp.set_cookie("token", token, httponly=True, samesite="Lax", secure=False)
+    return resp
 
 @app.route("/api/login", methods=["POST"])
 def api_login():
@@ -294,7 +306,15 @@ def api_login():
         return jsonify({"error": "Invalid credentials"}), 401
 
     token = create_token(row['id'])
-    return jsonify({"token": token})
+    resp = make_response(jsonify({"status": "ok"}))
+    resp.set_cookie("token", token, httponly=True, samesite="Lax", secure=False)
+    return resp
+
+@app.route("/logout", methods=["POST"])
+def api_logout():
+    resp = make_response(jsonify({"status": "ok"}))
+    resp.delete_cookie("token")
+    return resp
 
 # -------------------------------
 # File Serve
@@ -310,4 +330,4 @@ with app.app_context():
     init_db()
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=8000)
+    app.run(debug=False, host="0.0.0.0", port=80)
