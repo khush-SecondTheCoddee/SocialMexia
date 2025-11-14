@@ -6,7 +6,7 @@ import functools
 import uuid
 from typing import Optional
 
-from flask import Flask, request, jsonify, g, send_from_directory
+from flask import Flask, request, jsonify, g, send_from_directory, render_template_string
 import jwt  # PyJWT
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
@@ -69,7 +69,6 @@ def create_token(user_id: int):
         "exp": datetime.datetime.utcnow() + datetime.timedelta(seconds=JWT_EXP_SECONDS),
     }
     token = jwt.encode(payload, app.config["SECRET_KEY"], algorithm=JWT_ALGORITHM)
-    # PyJWT may return bytes in older versions; ensure str
     if isinstance(token, bytes):
         token = token.decode("utf-8")
     return token
@@ -186,12 +185,11 @@ def get_user_by_username(username: str):
 
 def save_image_file(file_storage=None, image_base64=None):
     if file_storage:
-        filename = f"{uuid.uuid4().hex}_{file_storage.filename}"
+        filename = f"{uuid.uuid4().hex}_{secure_filename(file_storage.filename)}" if file_storage.filename else f"{uuid.uuid4().hex}.bin"
         path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
         file_storage.save(path)
         return filename
     if image_base64:
-        # Expect data like "data:image/png;base64,AAAA..."
         if "," in image_base64:
             _, b64 = image_base64.split(",", 1)
         else:
@@ -208,13 +206,18 @@ def save_image_file(file_storage=None, image_base64=None):
     return None
 
 
+# werkzeug secure_filename helper
+from werkzeug.utils import secure_filename
+
+
 def post_to_dict(row, viewer_id=None):
     if row is None:
         return None
     post_id = row["id"]
-    # counts
-    likes_count = query_db("SELECT COUNT(*) as c FROM likes WHERE post_id = ?", (post_id,), one=True)["c"]
-    comments_count = query_db("SELECT COUNT(*) as c FROM comments WHERE post_id = ?", (post_id,), one=True)["c"]
+    likes_row = query_db("SELECT COUNT(*) as c FROM likes WHERE post_id = ?", (post_id,), one=True)
+    likes_count = likes_row["c"] if likes_row else 0
+    comments_row = query_db("SELECT COUNT(*) as c FROM comments WHERE post_id = ?", (post_id,), one=True)
+    comments_count = comments_row["c"] if comments_row else 0
     liked = False
     if viewer_id:
         r = query_db("SELECT 1 FROM likes WHERE post_id = ? AND user_id = ?", (post_id, viewer_id), one=True)
@@ -305,7 +308,6 @@ def get_profile(user_id):
     user = get_user_by_id(user_id)
     if not user:
         return jsonify({"error": "User not found"}), 404
-    # follower / following counts
     followers = query_db("SELECT COUNT(*) as c FROM follows WHERE following_id = ?", (user_id,), one=True)["c"]
     following = query_db("SELECT COUNT(*) as c FROM follows WHERE follower_id = ?", (user_id,), one=True)["c"]
     return jsonify({"user": user, "followers": followers, "following": following})
@@ -330,7 +332,6 @@ def follow(target_id):
     exists = query_db("SELECT 1 FROM users WHERE id = ?", (target_id,), one=True)
     if not exists:
         return jsonify({"error": "Target user not found"}), 404
-    # toggle follow/unfollow
     rel = query_db("SELECT id FROM follows WHERE follower_id = ? AND following_id = ?", (g.current_user["id"], target_id), one=True)
     if rel:
         execute_db("DELETE FROM follows WHERE id = ?", (rel["id"],))
@@ -395,40 +396,35 @@ def like_post(post_id):
         return jsonify({"status": "liked"})
 
 
-@app.route("/posts/<int:post_id>/comments", methods=["GET", "POST"])
-def comments_route(post_id):
+# Comments: split GET and POST so GET is public and POST requires auth
+@app.route("/posts/<int:post_id>/comments", methods=["GET"])
+def comments_get(post_id):
     row = query_db("SELECT * FROM posts WHERE id = ?", (post_id,), one=True)
     if not row:
         return jsonify({"error": "Post not found"}), 404
 
-    if request.method == "GET":
-        rows = query_db(
-            "SELECT c.*, u.username FROM comments c JOIN users u ON c.user_id = u.id WHERE post_id = ? ORDER BY created_at ASC",
-            (post_id,),
-        )
-        data = [
-            {"id": r["id"], "user": {"id": r["user_id"], "username": r["username"]}, "content": r["content"], "created_at": r["created_at"]}
-            for r in rows
-        ]
-        return jsonify({"comments": data})
+    rows = query_db(
+        "SELECT c.*, u.username FROM comments c JOIN users u ON c.user_id = u.id WHERE post_id = ? ORDER BY created_at ASC",
+        (post_id,),
+    )
+    data = [
+        {"id": r["id"], "user": {"id": r["user_id"], "username": r["username"]}, "content": r["content"], "created_at": r["created_at"]}
+        for r in rows
+    ]
+    return jsonify({"comments": data})
 
-    # POST (create)
-    # require auth
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return jsonify({"error": "Missing or invalid Authorization header"}), 401
-    token = auth.split(" ", 1)[1].strip()
-    payload = decode_token(token)
-    if not payload:
-        return jsonify({"error": "Invalid or expired token"}), 401
-    user = get_user_by_id(payload["sub"])
-    if not user:
-        return jsonify({"error": "User not found"}), 401
+
+@app.route("/posts/<int:post_id>/comments", methods=["POST"])
+@jwt_required
+def comments_post(post_id):
+    row = query_db("SELECT * FROM posts WHERE id = ?", (post_id,), one=True)
+    if not row:
+        return jsonify({"error": "Post not found"}), 404
     data = request.json or {}
     content = (data.get("content") or "").strip()
     if not content:
         return jsonify({"error": "content required"}), 400
-    comment_id = execute_db("INSERT INTO comments (user_id, post_id, content) VALUES (?, ?, ?)", (user["id"], post_id, content))
+    comment_id = execute_db("INSERT INTO comments (user_id, post_id, content) VALUES (?, ?, ?)", (g.current_user["id"], post_id, content))
     row = query_db("SELECT c.*, u.username FROM comments c JOIN users u ON c.user_id = u.id WHERE c.id = ?", (comment_id,), one=True)
     return jsonify({"comment": {"id": row["id"], "user": {"id": row["user_id"], "username": row["username"]}, "content": row["content"], "created_at": row["created_at"]}}), 201
 
@@ -437,8 +433,11 @@ def comments_route(post_id):
 @jwt_required
 def feed():
     # Simple feed: posts by the user and users they follow, paginated
-    limit = int(request.args.get("limit", 20))
-    offset = int(request.args.get("offset", 0))
+    try:
+        limit = int(request.args.get("limit", 20))
+        offset = int(request.args.get("offset", 0))
+    except ValueError:
+        return jsonify({"error": "limit and offset must be integers"}), 400
     rows = query_db(
         """
         SELECT p.* FROM posts p
@@ -455,8 +454,11 @@ def feed():
 
 @app.route("/users/<int:user_id>/posts", methods=["GET"])
 def user_posts(user_id):
-    limit = int(request.args.get("limit", 20))
-    offset = int(request.args.get("offset", 0))
+    try:
+        limit = int(request.args.get("limit", 20))
+        offset = int(request.args.get("offset", 0))
+    except ValueError:
+        return jsonify({"error": "limit and offset must be integers"}), 400
     rows = query_db("SELECT * FROM posts WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?", (user_id, limit, offset))
     viewer = getattr(g, "current_user", None)
     viewer_id = viewer["id"] if viewer else None
@@ -466,7 +468,6 @@ def user_posts(user_id):
 @app.route("/followings", methods=["GET"])
 @jwt_required
 def followings():
-    # list of users current user follows
     rows = query_db(
         "SELECT u.id, u.username FROM follows f JOIN users u ON f.following_id = u.id WHERE f.follower_id = ?",
         (g.current_user["id"],),
@@ -496,6 +497,255 @@ def search_posts():
     viewer = getattr(g, "current_user", None)
     viewer_id = viewer["id"] if viewer else None
     return jsonify({"results": [post_to_dict(r, viewer_id=viewer_id) for r in rows]})
+
+
+# Embedded simple HTML UI served at /
+INDEX_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Mini Social (demo)</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width:900px; margin: 20px auto; }
+    .col { display:flex; gap:20px; }
+    .card { border: 1px solid #ddd; padding:12px; border-radius:6px; margin-bottom:12px; }
+    .post img { max-width:100%; height:auto; }
+    .small { font-size:0.9em; color:#666; }
+    button { cursor:pointer; }
+    textarea { width:100%; min-height:60px; }
+  </style>
+</head>
+<body>
+  <h1>Mini Social — Demo UI</h1>
+
+  <div id="auth" class="card">
+    <div id="user-info"></div>
+
+    <div id="not-logged">
+      <h3>Register</h3>
+      <input id="reg-username" placeholder="username" /><br/>
+      <input id="reg-email" placeholder="email" /><br/>
+      <input id="reg-password" type="password" placeholder="password" /><br/>
+      <button onclick="register()">Register</button>
+
+      <hr/>
+      <h3>Login</h3>
+      <input id="login-identifier" placeholder="username or email" /><br/>
+      <input id="login-password" type="password" placeholder="password" /><br/>
+      <button onclick="login()">Login</button>
+    </div>
+
+    <div id="logged" style="display:none;">
+      <div>
+        Logged in as <strong id="me-username"></strong>
+        <button onclick="logout()">Logout</button>
+      </div>
+      <div class="small">Token: <span id="token-display" style="word-break:break-all;"></span></div>
+    </div>
+  </div>
+
+  <div class="col">
+    <div style="flex:2;">
+      <div class="card">
+        <h3>Create Post</h3>
+        <textarea id="post-content" placeholder="Write something..."></textarea><br/>
+        <input type="file" id="post-image" /><br/>
+        <button onclick="createPost()">Post</button>
+      </div>
+
+      <div class="card">
+        <h3>Feed</h3>
+        <div id="feed"></div>
+        <button onclick="loadFeed()">Refresh Feed</button>
+      </div>
+    </div>
+
+    <div style="flex:1;">
+      <div class="card">
+        <h3>Search Users</h3>
+        <input id="search-q" placeholder="username or email" />
+        <button onclick="searchUsers()">Search</button>
+        <div id="search-results"></div>
+      </div>
+      <div class="card">
+        <h3>My Followings</h3>
+        <div id="my-followings"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const api = (path, opts) => fetch(path, opts);
+function setLogged(token, user){
+  if(!token) { localStorage.removeItem('token'); document.getElementById('not-logged').style.display='block'; document.getElementById('logged').style.display='none'; document.getElementById('user-info').innerText=''; return; }
+  localStorage.setItem('token', token);
+  document.getElementById('not-logged').style.display='none';
+  document.getElementById('logged').style.display='block';
+  document.getElementById('me-username').innerText = user.username;
+  document.getElementById('token-display').innerText = token;
+  document.getElementById('user-info').innerText = '';
+  loadFeed();
+  loadFollowings();
+}
+function getToken(){ return localStorage.getItem('token') || ''; }
+
+async function register(){
+  const username = document.getElementById('reg-username').value;
+  const email = document.getElementById('reg-email').value;
+  const password = document.getElementById('reg-password').value;
+  const res = await api('/register', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username,email,password})
+  });
+  const j = await res.json();
+  if(!res.ok){ alert(j.error || JSON.stringify(j)); return; }
+  setLogged(j.token, j.user);
+}
+
+async function login(){
+  const identifier = document.getElementById('login-identifier').value;
+  const password = document.getElementById('login-password').value;
+  const res = await api('/login', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username: identifier, password})
+  });
+  const j = await res.json();
+  if(!res.ok){ alert(j.error || JSON.stringify(j)); return; }
+  setLogged(j.token, j.user);
+}
+
+function logout(){ setLogged(null); }
+
+async function createPost(){
+  const token = getToken();
+  const content = document.getElementById('post-content').value;
+  const file = document.getElementById('post-image').files[0];
+  if(file){
+    const fd = new FormData();
+    fd.append('content', content);
+    fd.append('image', file);
+    const res = await fetch('/posts', { method:'POST', body: fd, headers: token ? {'Authorization':'Bearer ' + token} : {} });
+    const j = await res.json();
+    if(!res.ok){ alert(j.error || JSON.stringify(j)); return; }
+    document.getElementById('post-content').value='';
+    document.getElementById('post-image').value='';
+    loadFeed();
+  } else {
+    const res = await api('/posts', { method:'POST', headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer ' + token }, body: JSON.stringify({content}) });
+    const j = await res.json();
+    if(!res.ok){ alert(j.error || JSON.stringify(j)); return; }
+    document.getElementById('post-content').value='';
+    loadFeed();
+  }
+}
+
+function buildPostHtml(p){
+  const imgHtml = p.image_url ? `<div><img src="${p.image_url}" /></div>` : '';
+  const likeBtn = `<button onclick="toggleLike(${p.id})">${p.liked_by_me ? 'Unlike' : 'Like'} (${p.likes_count})</button>`;
+  const commentBtn = `<button onclick="showComments(${p.id})">Comments (${p.comments_count})</button>`;
+  return `<div class="card post"><div><strong>@${p.user.username}</strong> <span class="small">${p.created_at}</span></div><div>${escapeHtml(p.content || '')}</div>${imgHtml}<div class="small">${likeBtn} ${commentBtn}</div><div id="comments-${p.id}"></div></div>`;
+}
+
+function escapeHtml(unsafe) {
+    return unsafe
+         .replaceAll('&', '&amp;')
+         .replaceAll('<', '&lt;')
+         .replaceAll('>', '&gt;')
+         .replaceAll('"', '&quot;')
+         .replaceAll("'", '&#039;');
+}
+
+async function loadFeed(){
+  const token = getToken();
+  const res = await api('/feed', { headers: token ? {'Authorization':'Bearer ' + token} : {} });
+  if(res.status === 401){ setLogged(null); return; }
+  const j = await res.json();
+  const feed = document.getElementById('feed');
+  feed.innerHTML = '';
+  if(!j.posts) return;
+  j.posts.forEach(p => feed.insertAdjacentHTML('beforeend', buildPostHtml(p)));
+}
+
+async function toggleLike(postId){
+  const token = getToken();
+  const res = await api(`/posts/${postId}/like`, { method:'POST', headers: {'Authorization':'Bearer ' + token} });
+  const j = await res.json();
+  if(!res.ok){ alert(j.error || JSON.stringify(j)); return; }
+  loadFeed();
+}
+
+async function showComments(postId){
+  const res = await api(`/posts/${postId}/comments`);
+  const j = await res.json();
+  const container = document.getElementById(`comments-${postId}`);
+  container.innerHTML = '';
+  if(j.comments){
+    j.comments.forEach(c => {
+      container.insertAdjacentHTML('beforeend', `<div class="small"><strong>@${c.user.username}</strong>: ${escapeHtml(c.content)}</div>`);
+    });
+  }
+  container.insertAdjacentHTML('beforeend', `<div><input id="comment-input-${postId}" placeholder="Write comment..." /> <button onclick="postComment(${postId})">Send</button></div>`);
+}
+
+async function postComment(postId){
+  const token = getToken();
+  if(!token){ alert('Login to comment'); return; }
+  const content = document.getElementById(`comment-input-${postId}`).value;
+  const res = await api(`/posts/${postId}/comments`, { method:'POST', headers:{'Content-Type':'application/json', 'Authorization':'Bearer ' + token}, body: JSON.stringify({content}) });
+  const j = await res.json();
+  if(!res.ok){ alert(j.error || JSON.stringify(j)); return; }
+  showComments(postId);
+}
+
+async function searchUsers(){
+  const q = document.getElementById('search-q').value;
+  const res = await api(`/users/search?q=${encodeURIComponent(q)}`);
+  const j = await res.json();
+  const out = document.getElementById('search-results');
+  out.innerHTML = '';
+  (j.results || []).forEach(u => {
+    out.insertAdjacentHTML('beforeend', `<div>${u.username} <button onclick="follow(${u.id})">Follow/Unfollow</button></div>`);
+  });
+}
+
+async function follow(userId){
+  const token = getToken();
+  const res = await api(`/follow/${userId}`, { method:'POST', headers: {'Authorization':'Bearer ' + token} });
+  const j = await res.json();
+  if(!res.ok){ alert(j.error || JSON.stringify(j)); return; }
+  loadFollowings();
+  loadFeed();
+}
+
+async function loadFollowings(){
+  const token = getToken();
+  const res = await api('/followings', { headers: token ? {'Authorization':'Bearer ' + token} : {} });
+  const j = await res.json();
+  const out = document.getElementById('my-followings');
+  out.innerHTML = '';
+  if(j.followings) j.followings.forEach(u => out.insertAdjacentHTML('beforeend', `<div>@${u.username}</div>`));
+}
+
+// restore session if token exists
+(async ()=> {
+  const token = getToken();
+  if(!token) return;
+  // try to get /me
+  const res = await api('/me', { headers: {'Authorization':'Bearer ' + token} });
+  if(res.ok){
+    const j = await res.json();
+    setLogged(token, j.user);
+  } else {
+    setLogged(null);
+  }
+})();
+</script>
+</body>
+</html>
+"""
+
+@app.route("/", methods=["GET"])
+def index_ui():
+    return render_template_string(INDEX_HTML)
 
 
 # Initialize DB at startup
